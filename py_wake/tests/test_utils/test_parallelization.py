@@ -52,3 +52,26 @@ def test_get_map_func():
     map_func = get_map_func(n_cpu=None, starmap=False, verbose=False)
     t = timeit(lambda x: list(map_func(f, x)), min_runs=3)(np.arange(6))[1]
     assert np.min(t) < 0.5
+
+
+class _Offset:
+    def __init__(self, offset):
+        self.offset = offset
+
+    def add(self, x):
+        return x + self.offset
+
+    def add_pair(self, x, y):
+        return x + y + self.offset
+
+
+def test_bound_method_is_sent_once_per_map():
+    # Two instances on the reused pool. The second map must not keep the first offset.
+    first = _Offset(10)
+    second = _Offset(0)
+    map_func = get_map_func(n_cpu=2, verbose=False)
+    assert list(map_func(first.add, [1, 2, 3, 4])) == [11, 12, 13, 14]
+    assert list(map_func(second.add, [1, 2, 3, 4])) == [1, 2, 3, 4]
+
+    star = get_map_func(n_cpu=2, starmap=True, verbose=False)
+    assert list(star(first.add_pair, [(1, 2), (3, 4)])) == [13, 17]

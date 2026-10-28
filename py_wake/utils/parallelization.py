@@ -1,8 +1,10 @@
 import atexit
 import gc
 import multiprocessing
+import pickle
 import platform
 from itertools import starmap
+from multiprocessing import shared_memory
 
 
 def load_MPI():
@@ -47,10 +49,50 @@ def get_pool(processes=multiprocessing.cpu_count()):
 #         return r
 
 
+# One unpickled model per worker. The key is the shared-memory block for this map.
+_worker_model = {"key": None, "model": None}
+
+
+def _is_instance_method(func):
+    instance = getattr(func, "__self__", None)
+    return instance is not None and not isinstance(instance, type)
+
+
+def _invoke_shared_method(task):
+    shm_name, nbytes, method_name, arg, star = task
+    if _worker_model["key"] != shm_name:
+        shm = shared_memory.SharedMemory(name=shm_name, track=False)
+        try:
+            data = bytes(shm.buf[:nbytes])
+        finally:
+            shm.close()
+        _worker_model["model"] = pickle.loads(data)
+        _worker_model["key"] = shm_name
+    method = getattr(_worker_model["model"], method_name)
+    if star:
+        return method(*arg)
+    return method(arg)
+
+
+def _pool_map_method(pool, func, iterable, chunksize, star, verbose):
+    """Pickle the instance once per map. Tasks carry only the method name and the chunk."""
+    blob = pickle.dumps(func.__self__, protocol=pickle.HIGHEST_PROTOCOL)
+    shm = shared_memory.SharedMemory(create=True, size=len(blob))
+    try:
+        shm.buf[:len(blob)] = blob
+        tasks = [(shm.name, len(blob), func.__name__, arg, star) for arg in iterable]
+        return pool.map(_invoke_shared_method, get_tqdm_iterable(tasks, verbose=verbose), chunksize)
+    finally:
+        shm.close()
+        shm.unlink()
+
+
 def get_pool_map(n_cpu=multiprocessing.cpu_count(), starmap=False, verbose=True):
     pool = get_pool(n_cpu)
 
     def pool_map(func, iterable, chunksize=None):
+        if _is_instance_method(func):
+            return _pool_map_method(pool, func, iterable, chunksize, starmap, verbose)
         iterable = get_tqdm_iterable(iterable, verbose=verbose)
         if starmap:
             return pool.starmap(func, iterable, chunksize)
